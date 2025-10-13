@@ -1,2 +1,6 @@
 streamlit
 pandas
+plotly
+PyPDF2
+pdfplumber
+PyMuPDF
