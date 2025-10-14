@@ -1,484 +1,411 @@
+# streamlit_pdf_quiz_pro.py
 import streamlit as st
+import pdfplumber
+import pytesseract
+from PIL import Image
+import re
+import time
+import io
+import random
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
-import time
-import pdfplumber
-import re
+import base64
+import os
+import hashlib
 import json
+import tempfile
+from typing import List, Dict, Any
 
-# Page configuration
-st.set_page_config(
-    page_title="PDF Quiz Pro",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ---------------------------
+# Helpers & Caching
+# ---------------------------
 
-# Custom CSS
+def file_hash(file_bytes: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(file_bytes)
+    return h.hexdigest()
+
+@st.cache_data(show_spinner=False)
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text with pdfplumber first, fallback to pytesseract for scanned pages.
+       This is cached by pdf bytes hash to speed repeated re-runs."""
+    text = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text and page_text.strip():
+                    text.append(page_text)
+                else:
+                    # fallback OCR on page image
+                    try:
+                        pil_img = page.to_image(resolution=200).original
+                        ocr_text = pytesseract.image_to_string(pil_img)
+                        text.append(ocr_text)
+                    except Exception:
+                        # if a page fails, append empty string but continue
+                        text.append("")
+    except Exception as e:
+        raise RuntimeError(f"Failed to open/process PDF: {e}")
+    return "\n".join(text)
+
+def guess_question_type(question: str) -> str:
+    q = question.lower()
+    if any(word in q for word in ['synonym', 'antonym', 'word', 'meaning']):
+        return "vocabulary"
+    if any(word in q for word in ['tense', 'grammar', 'sentence', 'verb']):
+        return "grammar"
+    if any(word in q for word in ['passage', 'read', 'comprehension']):
+        return "comprehension"
+    if any(word in q for word in ['logic', 'reason', 'deduce', 'infer']):
+        return "logic"
+    return "general"
+
+def generate_ai_explanation(question: str, correct_answer: str, options: Dict[str,str]) -> str:
+    explanations = {
+        "grammar": "This question tests your understanding of grammatical rules.",
+        "vocabulary": "This vocabulary question requires understanding word meanings and contextual usage.",
+        "comprehension": "This reading comprehension question tests your ability to understand and interpret written text.",
+        "logic": "This logical reasoning question requires analytical thinking and deduction skills.",
+        "general": "This question evaluates fundamental knowledge in the subject area."
+    }
+    etype = guess_question_type(question)
+    base = explanations.get(etype, explanations["general"])
+    tips = f"\n\nWhy {correct_answer} is correct:\n\n- It follows the rules of {etype}.\n- The other options contain common misconceptions.\n\nTip: Practice similar {etype} questions."
+    return base + tips
+
+@st.cache_data(show_spinner=False)
+def parse_pdf_questions(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    """Parse questions out of raw PDF text. Returns list of question dicts."""
+    raw_text = extract_text_from_pdf_bytes(pdf_bytes)
+    # Split heuristically on Q<number> or lines starting with number + dot
+    parts = re.split(r'(?i)\bq\d+\.|\n\d+\.\s', raw_text)
+    questions = []
+    # First element before Q1 might be header -> skip if empty
+    for idx, block in enumerate(parts[1:], start=1):
+        b = block.strip()
+        if not b:
+            continue
+        # Question text until options or Answer:
+        question_match = re.search(r'^(.*?)(?=\n[A-E]\)|\n[A-E]\.|Answer:|ANSWER:|$)', b, re.DOTALL)
+        question_text = question_match.group(1).strip() if question_match else b[:200].strip()
+
+        # Extract option lines like A) text or A. text
+        options_found = dict()
+        for opt_letter, opt_text in re.findall(r'([A-E])[\)\.]\s*(.*?)(?=(?:\n[A-E][\)\.]|\nAnswer:|\nANSWER:|$))', b, re.DOTALL):
+            options_found[opt_letter] = opt_text.strip().replace("\n", " ")
+
+        if not options_found:
+            # Try single-line options with uppercase letters
+            # fallback default
+            options_found = {'A': 'Option A', 'B': 'Option B', 'C': 'Option C', 'D': 'Option D'}
+
+        answer_match = re.search(r'(?i)Answer[:\s]*([A-E])', b)
+        correct = answer_match.group(1) if answer_match else random.choice(list(options_found.keys()))
+
+        ai_expl = generate_ai_explanation(question_text, correct, options_found)
+        questions.append({
+            "id": idx,
+            "question": question_text,
+            "options": options_found,
+            "correct_answer": correct,
+            "ai_explanation": ai_expl,
+            "difficulty": random.choice(["Easy", "Medium", "Hard"]),
+            "time_spent": 0,
+            "attempts": 0
+        })
+    return questions
+
+# Utility to convert questions to dataframe
+def questions_to_df(questions: List[Dict[str,Any]]) -> pd.DataFrame:
+    rows = []
+    for q in questions:
+        row = {
+            "id": q["id"],
+            "question": q["question"],
+            "correct": q["correct_answer"],
+            "difficulty": q.get("difficulty", ""),
+        }
+        for k,v in q["options"].items():
+            row[f"opt_{k}"] = v
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+# ---------------------------
+# UI / App
+# ---------------------------
+
+st.set_page_config(page_title="PDF Quiz PRO — Professional", layout="wide", page_icon="🚀")
+
+# Top bar
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 1rem;
-        font-weight: bold;
-    }
-    .question-box {
-        background: white;
-        padding: 2rem;
-        border-radius: 10px;
-        border-left: 5px solid #1f77b4;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        margin: 1rem 0;
-    }
-    .option-box {
-        background: #f8f9fa;
-        padding: 1rem;
-        margin: 0.5rem 0;
-        border-radius: 8px;
-        border: 2px solid #e9ecef;
-        cursor: pointer;
-        transition: all 0.3s ease;
-    }
-    .option-box:hover {
-        background: #e9ecef;
-        border-color: #1f77b4;
-    }
-    .option-selected {
-        background: #1f77b4 !important;
-        color: white !important;
-        border-color: #1f77b4 !important;
-    }
-    .option-correct {
-        background: #28a745 !important;
-        color: white !important;
-        border-color: #28a745 !important;
-    }
-    .option-incorrect {
-        background: #dc3545 !important;
-        color: white !important;
-        border-color: #dc3545 !important;
-    }
-    .timer-box {
-        background: #1f77b4;
-        color: white;
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-        font-size: 1.2rem;
-        font-weight: bold;
-        margin: 1rem 0;
-    }
-    .nav-btn {
-        width: 40px;
-        height: 40px;
-        margin: 2px;
-        border: 2px solid #1f77b4;
-        border-radius: 5px;
-        background: white;
-        color: #1f77b4;
-        font-weight: bold;
-    }
-    .nav-btn:hover {
-        background: #1f77b4;
-        color: white;
-    }
-    .nav-btn-active {
-        background: #1f77b4 !important;
-        color: white !important;
-    }
-    .nav-btn-answered {
-        background: #28a745 !important;
-        color: white !important;
-        border-color: #28a745 !important;
-    }
-    .nav-btn-marked {
-        background: #ffc107 !important;
-        color: black !important;
-        border-color: #ffc107 !important;
-    }
+/* small improvements for a polished header */
+.header {
+  display:flex; align-items:center; gap:16px;
+}
+.app-title {
+  font-size:24px; font-weight:700;
+}
+.small-muted { color: #6c757d; font-size:13px; }
 </style>
 """, unsafe_allow_html=True)
 
-class PDFQuizExtractor:
-    def __init__(self):
-        pass
-    
-    def extract_questions_from_pdf(self, pdf_file):
-        """Extract questions from PDF"""
-        questions = []
+col1, col2, col3 = st.columns([1,6,1])
+with col1:
+    st.image("https://raw.githubusercontent.com/streamlit/streamlit/develop/frontend/public/brand/streamlit-mark.svg", width=48)
+with col2:
+    st.markdown('<div class="header"><div class="app-title">PDF Quiz PRO — Professional</div><div class="small-muted">Upload. Parse. Practice. Analyze.</div></div>', unsafe_allow_html=True)
+with col3:
+    # Small profile / quick stats
+    if "user_profile" not in st.session_state:
+        st.session_state.user_profile = {"xp":0, "total_quizzes":0, "achievements":[]}
+
+# Sidebar controls (streamlit-native)
+st.sidebar.header("⚙️ Controls")
+mode = st.sidebar.radio("Mode", ["Practice", "Exam"], index=0)
+view = st.sidebar.radio("Default View", ["Question", "Overview"], index=0)
+st.sidebar.markdown("---")
+st.sidebar.header("Settings")
+sound_enabled = st.sidebar.checkbox("Enable sounds", value=st.session_state.get("sound_enabled", True))
+st.session_state["sound_enabled"] = sound_enabled
+auto_show_ai = st.sidebar.checkbox("Auto show AI explanation after answer", value=False)
+st.sidebar.markdown("---")
+st.sidebar.header("Export / Persistence")
+persist = st.sidebar.checkbox("Persist progress in memory (browser)", value=True)
+if st.sidebar.button("Reset saved progress"):
+    for k in ["user_answers", "current_q", "quiz_completed", "marked_review", "questions", "uploaded_file_hash"]:
+        if k in st.session_state:
+            del st.session_state[k]
+    st.sidebar.success("Progress cleared")
+
+# Upload area
+st.markdown("### 📁 Upload your PDF")
+uploaded_file = st.file_uploader("Upload a PDF with questions (Q1., options A) B) ..., Answer: X)", type="pdf")
+
+# Local helper: save uploaded bytes
+if uploaded_file:
+    file_bytes = uploaded_file.getvalue()
+    uploaded_hash = file_hash(file_bytes)
+    st.session_state["uploaded_file_hash"] = uploaded_hash
+
+    # If not parsed before or new file, parse and initialize
+    if st.session_state.get("questions") is None or st.session_state.get("uploaded_file_hash") != uploaded_hash:
         try:
-            with pdfplumber.open(pdf_file) as pdf:
-                full_text = ""
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        full_text += text + "\n"
-            
-            # Simple question extraction logic
-            lines = full_text.split('\n')
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                if line and ('?' in line or line.endswith('?')):
-                    # Found a question
-                    question_text = line
-                    options = []
-                    answer = None
-                    
-                    # Look for options in next lines
-                    for j in range(i+1, min(i+10, len(lines))):
-                        opt_line = lines[j].strip()
-                        if opt_line.startswith(('A)', 'B)', 'C)', 'D)', 'a)', 'b)', 'c)', 'd)')):
-                            options.append(opt_line)
-                        elif 'answer' in opt_line.lower():
-                            # Extract answer
-                            if 'A' in opt_line.upper() or 'a)' in opt_line.lower():
-                                answer = 'A'
-                            elif 'B' in opt_line.upper() or 'b)' in opt_line.lower():
-                                answer = 'B'
-                            elif 'C' in opt_line.upper() or 'c)' in opt_line.lower():
-                                answer = 'C'
-                            elif 'D' in opt_line.upper() or 'd)' in opt_line.lower():
-                                answer = 'D'
-                    
-                    if len(options) >= 2 and answer:
-                        # Clean options
-                        clean_options = []
-                        for opt in options[:4]:  # Take first 4 options
-                            clean_opt = re.sub(r'^[A-Da-d][\)\.]\s*', '', opt)
-                            clean_options.append(clean_opt)
-                        
-                        # Add question
-                        questions.append({
-                            'id': len(questions) + 1,
-                            'question': question_text,
-                            'options': clean_options,
-                            'correct_answer': answer.upper(),
-                            'correct_index': ord(answer.upper()) - ord('A'),
-                            'type': 'mcq',
-                            'marks': 1
-                        })
-                
-                i += 1
-            
-            return questions
-            
+            with st.spinner("Processing PDF — extracting questions..."):
+                questions = parse_pdf_questions(file_bytes)
+                if not questions:
+                    st.error("No questions detected — check PDF format.")
+                    st.stop()
+                st.session_state["questions"] = questions
+                # initialize user state
+                st.session_state["user_answers"] = {}  # id -> option
+                st.session_state["current_q"] = 0
+                st.session_state["quiz_completed"] = False
+                st.session_state["marked_review"] = []
+                st.session_state["start_time"] = time.time()
+                st.session_state["question_start_time"] = time.time()
         except Exception as e:
-            st.error(f"Error processing PDF: {str(e)}")
-            return []
+            st.exception(e)
+            st.stop()
 
-class QuizManager:
-    def __init__(self):
-        self.questions = []
-        self.session_history = []
-    
-    def load_sample_questions(self):
-        """Load sample questions"""
-        self.questions = [
-            {
-                'id': 1,
-                'question': "What is the first prime number?",
-                'options': ["1", "2", "3", "4"],
-                'correct_answer': "B",
-                'correct_index': 1,
-                'type': 'mcq',
-                'marks': 1
-            },
-            {
-                'id': 2,
-                'question': "Which language is used for web development?",
-                'options': ["Python", "Java", "JavaScript", "C++"],
-                'correct_answer': "C",
-                'correct_index': 2,
-                'type': 'mcq',
-                'marks': 1
-            },
-            {
-                'id': 3,
-                'question': "What does CPU stand for?",
-                'options': ["Central Processing Unit", "Computer Personal Unit", "Central Processor Unit", "Central Process Unit"],
-                'correct_answer': "A",
-                'correct_index': 0,
-                'type': 'mcq',
-                'marks': 1
-            },
-            {
-                'id': 4,
-                'question': "Which data structure uses LIFO?",
-                'options': ["Queue", "Stack", "Array", "Linked List"],
-                'correct_answer': "B",
-                'correct_index': 1,
-                'type': 'mcq',
-                'marks': 1
-            },
-            {
-                'id': 5,
-                'question': "What is the capital of France?",
-                'options': ["London", "Berlin", "Paris", "Madrid"],
-                'correct_answer': "C",
-                'correct_index': 2,
-                'type': 'mcq',
-                'marks': 1
-            }
-        ]
+# If questions loaded, show preview & main UI
+if st.session_state.get("questions"):
+    questions = st.session_state["questions"]
+    totalq = len(questions)
 
-def initialize_session_state():
-    """Initialize session state"""
-    if 'quiz_started' not in st.session_state:
-        st.session_state.quiz_started = False
-    if 'quiz_finished' not in st.session_state:
-        st.session_state.quiz_finished = False
-    if 'current_question' not in st.session_state:
-        st.session_state.current_question = 0
-    if 'answers' not in st.session_state:
-        st.session_state.answers = {}
-    if 'marked_questions' not in st.session_state:
-        st.session_state.marked_questions = set()
-    if 'show_answers' not in st.session_state:
-        st.session_state.show_answers = False
-    if 'start_time' not in st.session_state:
-        st.session_state.start_time = None
-    if 'time_remaining' not in st.session_state:
-        st.session_state.time_remaining = 1800
-    if 'total_time' not in st.session_state:
-        st.session_state.total_time = 1800
-    if 'quiz_manager' not in st.session_state:
-        st.session_state.quiz_manager = QuizManager()
-    if 'pdf_extractor' not in st.session_state:
-        st.session_state.pdf_extractor = PDFQuizExtractor()
-    if 'session_history' not in st.session_state:
-        st.session_state.session_history = []
+    # show PDF first page preview (if possible)
+    if uploaded_file:
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                first_page = pdf.pages[0]
+                pil_img = first_page.to_image(resolution=150).original
+                st.image(pil_img, caption="PDF preview (first page)", use_column_width=False)
+        except Exception:
+            pass
 
-def main():
-    initialize_session_state()
-    
-    st.markdown('<div class="main-header">📚 PDF Quiz Pro</div>', unsafe_allow_html=True)
-    
-    # Sidebar
-    with st.sidebar:
-        st.markdown("### ⚙️ Configuration")
-        
-        if not st.session_state.quiz_started:
-            # Time settings
-            st.session_state.total_time = st.slider(
-                "Exam Duration (minutes):",
-                min_value=5,
-                max_value=180,
-                value=30
-            ) * 60
-            
-            # PDF upload
-            st.markdown("### 📁 Upload Questions")
-            pdf_file = st.file_uploader("Upload PDF with MCQs", type=['pdf'])
-            
-            if pdf_file is not None:
-                if st.button("Extract Questions from PDF"):
-                    with st.spinner("Extracting questions from PDF..."):
-                        questions = st.session_state.pdf_extractor.extract_questions_from_pdf(pdf_file)
-                        if questions:
-                            st.session_state.quiz_manager.questions = questions
-                            st.success(f"✅ Extracted {len(questions)} questions!")
-                        else:
-                            st.error("❌ No questions found. Using sample questions.")
-                            st.session_state.quiz_manager.load_sample_questions()
-            else:
-                if st.button("Use Sample Questions"):
-                    st.session_state.quiz_manager.load_sample_questions()
-                    st.success("✅ Sample questions loaded!")
-            
-            # Start button
-            if st.session_state.quiz_manager.questions:
-                if st.button("🚀 Start Exam", type="primary", use_container_width=True):
-                    st.session_state.quiz_started = True
-                    st.session_state.start_time = time.time()
-                    st.rerun()
+    # Top quick stats
+    answered = len(st.session_state["user_answers"])
+    correct_count = sum(1 for q in questions if st.session_state["user_answers"].get(q["id"]) == q["correct_answer"])
+    progress_col1, progress_col2, progress_col3, progress_col4 = st.columns([2,2,2,4])
+    progress_col1.metric("Questions", f"{answered}/{totalq}")
+    progress_col2.metric("Correct", f"{correct_count}/{answered}" if answered else "0/0")
+    accuracy = (correct_count/answered*100) if answered else 0
+    progress_col3.metric("Accuracy", f"{accuracy:.1f}%")
+    # progress bar
+    progress_col4.progress(int((answered/totalq)*100) if totalq else 0)
 
-    # Main content
-    if not st.session_state.quiz_manager.questions:
-        st.info("👆 Please upload a PDF or use sample questions to start the quiz.")
-        
-    elif st.session_state.quiz_started and not st.session_state.quiz_finished:
-        # Timer
-        if st.session_state.quiz_started:
-            elapsed = time.time() - st.session_state.start_time
-            remaining = st.session_state.total_time - elapsed
-            
-            if remaining <= 0:
-                st.session_state.quiz_finished = True
-                remaining = 0
-            
-            st.session_state.time_remaining = max(0, int(remaining))
-            
-            minutes = st.session_state.time_remaining // 60
-            seconds = st.session_state.time_remaining % 60
-            
-            st.markdown(f'''
-            <div class="timer-box">
-                ⏰ Time Remaining: {minutes:02d}:{seconds:02d}
-            </div>
-            ''', unsafe_allow_html=True)
-            
-            if st.session_state.time_remaining <= 0:
-                st.session_state.quiz_finished = True
-                st.rerun()
-        
-        # Question navigation
-        st.sidebar.markdown("### 🧭 Navigation")
-        
-        col1, col2, col3 = st.sidebar.columns(3)
-        with col1:
-            if st.button("⏮️", use_container_width=True, disabled=st.session_state.current_question == 0):
-                st.session_state.current_question -= 1
-                st.rerun()
-        with col2:
-            st.markdown(f"**{st.session_state.current_question + 1}/{len(st.session_state.quiz_manager.questions)}**")
-        with col3:
-            if st.button("⏭️", use_container_width=True, 
-                        disabled=st.session_state.current_question == len(st.session_state.quiz_manager.questions) - 1):
-                st.session_state.current_question += 1
-                st.rerun()
-        
-        # Question palette
-        st.sidebar.markdown("### 🔢 Questions")
-        questions = st.session_state.quiz_manager.questions
-        cols = st.sidebar.columns(5)
-        
-        for i in range(len(questions)):
-            col_idx = i % 5
-            with cols[col_idx]:
-                q_id = questions[i]['id']
-                answered = q_id in st.session_state.answers
-                marked = q_id in st.session_state.marked_questions
-                current = i == st.session_state.current_question
-                
-                btn_type = "primary" if current else "secondary"
-                label = str(i + 1)
-                
-                if marked:
-                    label = f"📍{i+1}"
-                
-                if cols[col_idx].button(label, key=f"nav_{i}", use_container_width=True, type=btn_type):
-                    st.session_state.current_question = i
-                    st.rerun()
-        
-        # Submit button
-        st.sidebar.markdown("---")
-        if st.sidebar.button("✅ Submit Exam", type="primary", use_container_width=True):
-            st.session_state.quiz_finished = True
-            st.rerun()
-        
-        # Current question
-        current_q = st.session_state.quiz_manager.questions[st.session_state.current_question]
-        current_q_id = current_q['id']
-        
-        st.markdown(f'<div class="question-box">', unsafe_allow_html=True)
-        st.markdown(f"### ❓ Question {st.session_state.current_question + 1}")
-        st.markdown(f"**{current_q['question']}**")
-        
-        # Options
-        current_answer = st.session_state.answers.get(current_q_id, None)
-        options = current_q['options']
-        
-        for i, option in enumerate(options):
-            option_letter = chr(65 + i)
-            option_class = "option-box"
-            
-            if st.session_state.quiz_finished:
-                if i == current_q['correct_index']:
-                    option_class += " option-correct"
-                elif current_answer == i:
-                    option_class += " option-incorrect"
-            elif current_answer == i:
-                option_class += " option-selected"
-            
-            if st.button(f"{option_letter}) {option}", key=f"opt_{current_q_id}_{i}", 
-                        use_container_width=True):
-                st.session_state.answers[current_q_id] = i
-                st.rerun()
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Mark question button
-        is_marked = current_q_id in st.session_state.marked_questions
-        mark_text = "✅ Unmark Question" if is_marked else "📍 Mark Question"
-        if st.button(mark_text, use_container_width=True):
-            if is_marked:
-                st.session_state.marked_questions.remove(current_q_id)
-            else:
-                st.session_state.marked_questions.add(current_q_id)
-            st.rerun()
-    
-    elif st.session_state.quiz_finished:
-        # Calculate results
-        score = 0
-        for q_id, answer in st.session_state.answers.items():
-            question = next((q for q in st.session_state.quiz_manager.questions if q['id'] == q_id), None)
-            if question and answer == question['correct_index']:
-                score += 1
-        
-        # Save to history
-        history_entry = {
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'score': score,
-            'total': len(st.session_state.quiz_manager.questions),
-            'percentage': (score / len(st.session_state.quiz_manager.questions)) * 100
-        }
-        st.session_state.session_history.append(history_entry)
-        
-        # Display results
-        st.markdown('<div class="main-header">📊 Quiz Results</div>', unsafe_allow_html=True)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Score", f"{score}/{len(st.session_state.quiz_manager.questions)}")
-        with col2:
-            st.metric("Percentage", f"{(score/len(st.session_state.quiz_manager.questions))*100:.1f}%")
-        with col3:
-            st.metric("Time Taken", f"{int((st.session_state.total_time - st.session_state.time_remaining)/60)}m")
-        
-        # Question review
-        st.markdown("### 📋 Question Review")
-        for i, question in enumerate(st.session_state.quiz_manager.questions):
-            q_id = question['id']
-            user_answer = st.session_state.answers.get(q_id, None)
-            is_correct = user_answer == question['correct_index']
-            
-            status = "✅ Correct" if is_correct else "❌ Incorrect" if user_answer is not None else "⏭️ Not Attempted"
-            
-            with st.expander(f"Question {i+1}: {status}"):
-                st.write(f"**{question['question']}**")
-                for j, option in enumerate(question['options']):
-                    option_letter = chr(65 + j)
-                    if j == question['correct_index']:
-                        st.success(f"{option_letter}) {option} ✓")
-                    elif j == user_answer:
-                        st.error(f"{option_letter}) {option} ✗")
+    # two-pane layout: left: quiz, right: analytics + editor
+    left, right = st.columns([3,2])
+
+    # ---------- LEFT: Quiz UI ----------
+    with left:
+        st.subheader("📝 Quiz Area")
+        idx = st.session_state.get("current_q", 0)
+        idx = max(0, min(idx, totalq-1))
+        st.session_state["current_q"] = idx
+        q = questions[idx]
+
+        # Question card
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg,#667eea,#764ba2); padding:16px; border-radius:12px; color:white;">
+            <div style="font-weight:700">Question {idx+1} of {totalq} — Difficulty: {q.get('difficulty')}</div>
+            <div style="margin-top:8px; font-size:16px;">{q['question']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Options (buttons)
+        st.write("")  # small spacer
+        cols = st.columns(2)
+        for i, (opt_letter, opt_text) in enumerate(q["options"].items()):
+            col = cols[i % 2]
+            is_selected = st.session_state["user_answers"].get(q["id"]) == opt_letter
+            btn_label = f"{opt_letter}) {opt_text}"
+            if col.button(btn_label, key=f"opt_{q['id']}_{opt_letter}", help=f"Select option {opt_letter}"):
+                st.session_state["user_answers"][q["id"]] = opt_letter
+                questions[idx]["attempts"] = questions[idx].get("attempts", 0) + 1
+                # play sound: minimal safe HTML audio
+                if st.session_state["sound_enabled"]:
+                    if opt_letter == q["correct_answer"]:
+                        st.audio("https://assets.mixkit.co/sfx/preview/mixkit-correct-answer-tone-2870.mp3")
                     else:
-                        st.write(f"{option_letter}) {option}")
-        
-        # Session History
-        st.markdown("### 📜 Session History")
-        if st.session_state.session_history:
-            history_df = pd.DataFrame(st.session_state.session_history)
-            st.dataframe(history_df, use_container_width=True)
-            
-            # Chart
-            fig = px.line(history_df, x='timestamp', y='percentage', 
-                         title="Performance Trend", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No history available yet.")
-        
-        # Restart button
-        if st.button("🔄 Take Another Quiz", type="primary", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                if key not in ['quiz_manager', 'pdf_extractor', 'session_history']:
-                    del st.session_state[key]
-            st.rerun()
+                        st.audio("https://assets.mixkit.co/sfx/preview/mixkit-wrong-answer-fail-notification-946.mp3")
+                # auto reveal explanation if setting on
+                if auto_show_ai:
+                    st.session_state.setdefault("show_ai", {})[q["id"]] = True
+                st.experimental_rerun()
 
-if __name__ == "__main__":
-    main()
+        # Show check / navigation controls
+        nav1, nav2, nav3, nav4 = st.columns([1,1,1,1])
+        with nav1:
+            if st.button("◀ Prev", disabled=idx==0):
+                st.session_state["current_q"] = max(0, idx-1)
+                st.session_state["question_start_time"] = time.time()
+                st.experimental_rerun()
+        with nav2:
+            mark_text = "📌 Mark" if idx not in st.session_state["marked_review"] else "✅ Unmark"
+            if st.button(mark_text):
+                if idx in st.session_state["marked_review"]:
+                    st.session_state["marked_review"].remove(idx)
+                else:
+                    st.session_state["marked_review"].append(idx)
+                st.experimental_rerun()
+        with nav3:
+            if st.button("Next ▶", disabled=idx==totalq-1):
+                st.session_state["current_q"] = min(totalq-1, idx+1)
+                st.session_state["question_start_time"] = time.time()
+                st.experimental_rerun()
+        with nav4:
+            if st.button("Finish"):
+                st.session_state["quiz_completed"] = True
+                st.experimental_rerun()
+
+        # AI explanation
+        if st.session_state.get("show_ai", {}).get(q["id"], False) or auto_show_ai:
+            st.markdown("### 🤖 AI Explanation")
+            st.info(q["ai_explanation"])
+
+        # Inline question editor (quick edit)
+        with st.expander("✏️ Edit question / options"):
+            edited_q_text = st.text_area("Question text", value=q["question"], key=f"edit_q_{q['id']}")
+            opts = q["options"].copy()
+            edited_opts = {}
+            for opt_letter in sorted(opts.keys()):
+                edited_opts[opt_letter] = st.text_input(f"Option {opt_letter}", value=opts[opt_letter], key=f"edit_opt_{q['id']}_{opt_letter}")
+            correct_sel = st.selectbox("Correct option", options=list(edited_opts.keys()), index=list(edited_opts.keys()).index(q["correct_answer"]))
+            if st.button("Save edits", key=f"save_edit_{q['id']}"):
+                questions[idx]["question"] = edited_q_text
+                questions[idx]["options"] = edited_opts
+                questions[idx]["correct_answer"] = correct_sel
+                questions[idx]["ai_explanation"] = generate_ai_explanation(edited_q_text, correct_sel, edited_opts)
+                st.success("Saved edits")
+
+    # ---------- RIGHT: Analytics & Controls ----------
+    with right:
+        st.subheader("📊 Analytics & Actions")
+        # Basic analytics: difficulty distribution, attempts
+        df = questions_to_df(questions)
+        # Difficulty pie
+        fig1 = px.pie(df, names="difficulty", title="Difficulty distribution")
+        st.plotly_chart(fig1, use_container_width=True)
+
+        # Score gauge (live)
+        if totalq:
+            current_correct = sum(1 for q in questions if st.session_state["user_answers"].get(q["id"]) == q["correct_answer"])
+            score_percent = (current_correct / totalq) * 100
+        else:
+            score_percent = 0
+        gauge = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=score_percent,
+            title={"text":"Current Score (%)"},
+            gauge={"axis":{"range":[0,100]}, "bar":{"color":"darkblue"}}
+        ))
+        st.plotly_chart(gauge, use_container_width=True)
+
+        # Export buttons
+        st.markdown("---")
+        st.markdown("### Export / Save")
+        results_df = pd.DataFrame([{
+            "id": q["id"],
+            "question": q["question"],
+            "selected": st.session_state["user_answers"].get(q["id"], ""),
+            "correct": q["correct_answer"],
+            "is_correct": st.session_state["user_answers"].get(q["id"], "") == q["correct_answer"]
+        } for q in questions])
+        csv = results_df.to_csv(index=False).encode("utf-8")
+        json_export = json.dumps({"questions": questions, "answers": st.session_state["user_answers"]}, indent=2)
+        st.download_button("Download results CSV", csv, file_name="quiz_results.csv", mime="text/csv")
+        st.download_button("Download full JSON (questions+answers)", json_export, file_name="quiz_full.json", mime="application/json")
+
+        # Save progress to local browser storage (via session_state persistence)
+        if persist:
+            st.success("Progress will persist via session state while the app is open")
+
+        # Quick review list
+        st.markdown("---")
+        st.markdown("### Quick Review")
+        marked = st.session_state.get("marked_review", [])
+        st.write("Marked questions:", marked if marked else "None")
+
+    # If quiz is completed show results screen
+    if st.session_state.get("quiz_completed", False):
+        st.balloons()
+        st.markdown("## 🏁 Quiz Completed — Results")
+        total = len(questions)
+        correct = sum(1 for q in questions if st.session_state["user_answers"].get(q["id"]) == q["correct_answer"])
+        st.metric("Score", f"{correct}/{total}", delta=f"{(correct/total*100):.1f}%")
+        # show per-question breakdown
+        st.dataframe(results_df)
+
+        # Allow restart or new file
+        col_a, col_b = st.columns(2)
+        if col_a.button("🔄 Restart Quiz"):
+            # reset answers but keep parsed questions
+            st.session_state["user_answers"] = {}
+            st.session_state["current_q"] = 0
+            st.session_state["quiz_completed"] = False
+            st.experimental_rerun()
+
+        if col_b.button("🗑️ Clear and Upload New PDF"):
+            for k in ["questions", "user_answers", "current_q", "quiz_completed", "marked_review", "uploaded_file_hash"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.experimental_rerun()
+
+else:
+    # No questions loaded
+    st.info("Upload a PDF with questions structured like:\n\nQ1. What ...?\nA) ...\nB) ...\nAnswer: A")
+    st.markdown("""
+    **Tips for best parsing**
+    - Use consistent labels: `Q1.` and `A)` or `A.` and `Answer: A`
+    - Avoid multi-line options that contain `A)` inside.
+    """)
+
+# ---------------------------
+# Footer
+# ---------------------------
+st.markdown("---")
+st.markdown("Built with ❤️ — PDF Quiz PRO. Pro tips: For scanned PDFs, OCR may take a while; be patient.")
